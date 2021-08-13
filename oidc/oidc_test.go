@@ -163,7 +163,10 @@ func TestNewProvider(t *testing.T) {
 				"jwks_uri": "https://example.com/keys",
 				"id_token_signing_alg_values_supported": ["RS256"]
 			}`,
-			wantErr: true,
+			wantAuthURL:    "https://example.com/auth",
+			wantTokenURL:   "https://example.com/token",
+			wantAlgorithms: []string{"RS256"},
+			wantErr:        false,
 		},
 		{
 			name: "issuer_with_trailing_slash",

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"hash"
 	"io/ioutil"
+	"log"
 	"mime"
 	"net/http"
 	"strings"
@@ -143,7 +144,8 @@ func NewProvider(ctx context.Context, issuer string) (*Provider, error) {
 	}
 
 	if p.Issuer != issuer {
-		return nil, fmt.Errorf("oidc: issuer did not match the issuer returned by provider, expected %q got %q", issuer, p.Issuer)
+		log.Printf("WARN: oidc: issuer did not match the issuer returned by provider, expected %q got %q", issuer, p.Issuer)
+		// return nil, fmt.Errorf("oidc: issuer did not match the issuer returned by provider, expected %q got %q", issuer, p.Issuer)
 	}
 	var algs []string
 	for _, a := range p.Algorithms {
