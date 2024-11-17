@@ -2,6 +2,10 @@ package oidc
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,7 +13,9 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
+	jose "github.com/go-jose/go-jose/v4"
 	"golang.org/x/oauth2"
 )
 
@@ -91,6 +97,12 @@ func TestAccessTokenVerification(t *testing.T) {
 			assertMsg("id token did not have an access token hash"),
 		},
 		{
+			"EdDSA",
+			newToken("EdDSA", computed512TokenHash),
+			googleAccessToken,
+			assertNil,
+		},
+		{
 			"badSignAlgo",
 			newToken("none", "xxx"),
 			googleAccessToken,
@@ -104,14 +116,17 @@ func TestAccessTokenVerification(t *testing.T) {
 
 func TestNewProvider(t *testing.T) {
 	tests := []struct {
-		name            string
-		data            string
-		trailingSlash   bool
-		wantAuthURL     string
-		wantTokenURL    string
-		wantUserInfoURL string
-		wantAlgorithms  []string
-		wantErr         bool
+		name              string
+		data              string
+		issuerURLOverride string
+		trailingSlash     bool
+		wantAuthURL       string
+		wantTokenURL      string
+		wantDeviceAuthURL string
+		wantUserInfoURL   string
+		wantIssuerURL     string
+		wantAlgorithms    []string
+		wantErr           bool
 	}{
 		{
 			name: "basic_case",
@@ -133,11 +148,11 @@ func TestNewProvider(t *testing.T) {
 				"authorization_endpoint": "https://example.com/auth",
 				"token_endpoint": "https://example.com/token",
 				"jwks_uri": "https://example.com/keys",
-				"id_token_signing_alg_values_supported": ["RS256", "RS384", "ES256"]
+				"id_token_signing_alg_values_supported": ["RS256", "RS384", "ES256", "EdDSA"]
 			}`,
 			wantAuthURL:    "https://example.com/auth",
 			wantTokenURL:   "https://example.com/token",
-			wantAlgorithms: []string{"RS256", "RS384", "ES256"},
+			wantAlgorithms: []string{"RS256", "RS384", "ES256", "EdDSA"},
 		},
 		{
 			name: "unsupported_algorithms",
@@ -166,6 +181,21 @@ func TestNewProvider(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name:              "mismatched_issuer_discovery_override",
+			issuerURLOverride: "https://example.com",
+			data: `{
+				"issuer": "ISSUER",
+				"authorization_endpoint": "https://example.com/auth",
+				"token_endpoint": "https://example.com/token",
+				"jwks_uri": "https://example.com/keys",
+				"id_token_signing_alg_values_supported": ["RS256"]
+			}`,
+			wantIssuerURL:  "https://example.com",
+			wantAuthURL:    "https://example.com/auth",
+			wantTokenURL:   "https://example.com/token",
+			wantAlgorithms: []string{"RS256"},
+		},
+		{
 			name: "issuer_with_trailing_slash",
 			data: `{
 				"issuer": "ISSUER",
@@ -182,11 +212,12 @@ func TestNewProvider(t *testing.T) {
 		{
 			// Test case taken directly from:
 			// https://accounts.google.com/.well-known/openid-configuration
-			name:            "google",
-			wantAuthURL:     "https://accounts.google.com/o/oauth2/v2/auth",
-			wantTokenURL:    "https://oauth2.googleapis.com/token",
-			wantUserInfoURL: "https://openidconnect.googleapis.com/v1/userinfo",
-			wantAlgorithms:  []string{"RS256"},
+			name:              "google",
+			wantAuthURL:       "https://accounts.google.com/o/oauth2/v2/auth",
+			wantTokenURL:      "https://oauth2.googleapis.com/token",
+			wantDeviceAuthURL: "https://oauth2.googleapis.com/device/code",
+			wantUserInfoURL:   "https://openidconnect.googleapis.com/v1/userinfo",
+			wantAlgorithms:    []string{"RS256"},
 			data: `{
  "issuer": "ISSUER",
  "authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
@@ -269,6 +300,10 @@ func TestNewProvider(t *testing.T) {
 				issuer += "/"
 			}
 
+			if test.issuerURLOverride != "" {
+				ctx = InsecureIssuerURLContext(ctx, test.issuerURLOverride)
+			}
+
 			p, err := NewProvider(ctx, issuer)
 			if err != nil {
 				if !test.wantErr {
@@ -280,6 +315,11 @@ func TestNewProvider(t *testing.T) {
 				t.Fatalf("NewProvider(): expected error")
 			}
 
+			if test.wantIssuerURL != "" && p.issuer != test.wantIssuerURL {
+				t.Errorf("NewProvider() unexpected issuer value, got=%s, want=%s",
+					p.issuer, test.wantIssuerURL)
+			}
+
 			if p.authURL != test.wantAuthURL {
 				t.Errorf("NewProvider() unexpected authURL value, got=%s, want=%s",
 					p.authURL, test.wantAuthURL)
@@ -287,6 +327,10 @@ func TestNewProvider(t *testing.T) {
 			if p.tokenURL != test.wantTokenURL {
 				t.Errorf("NewProvider() unexpected tokenURL value, got=%s, want=%s",
 					p.tokenURL, test.wantTokenURL)
+			}
+			if p.deviceAuthURL != test.wantDeviceAuthURL {
+				t.Errorf("NewProvider() unexpected deviceAuthURL value, got=%s, want=%s",
+					p.deviceAuthURL, test.wantDeviceAuthURL)
 			}
 			if p.userInfoURL != test.wantUserInfoURL {
 				t.Errorf("NewProvider() unexpected userInfoURL value, got=%s, want=%s",
@@ -300,15 +344,15 @@ func TestNewProvider(t *testing.T) {
 	}
 }
 
-func TestCloneContext(t *testing.T) {
+func TestGetClient(t *testing.T) {
 	ctx := context.Background()
-	if _, ok := cloneContext(ctx).Value(oauth2.HTTPClient).(*http.Client); ok {
+	if c := getClient(ctx); c != nil {
 		t.Errorf("cloneContext(): expected no *http.Client from empty context")
 	}
 
 	c := &http.Client{}
 	ctx = ClientContext(ctx, c)
-	if got, ok := cloneContext(ctx).Value(oauth2.HTTPClient).(*http.Client); !ok || c != got {
+	if got := getClient(ctx); got == nil || c != got {
 		t.Errorf("cloneContext(): expected *http.Client from context")
 	}
 }
@@ -336,14 +380,19 @@ func (ts *testServer) run(t *testing.T) string {
 		]
 	}`
 
+	var userInfoJSON string
+	if ts.userInfo != "" {
+		userInfoJSON = fmt.Sprintf(`"userinfo_endpoint": "%s/userinfo",`, server.URL)
+	}
+
 	wellKnown := fmt.Sprintf(`{
 		"issuer": "%[1]s",
 		"authorization_endpoint": "%[1]s/auth",
 		"token_endpoint": "%[1]s/token",
 		"jwks_uri": "%[1]s/keys",
-		"userinfo_endpoint": "%[1]s/userinfo",
+		%[2]s
 		"id_token_signing_alg_values_supported": ["RS256"]
-	}`, server.URL)
+	}`, server.URL, userInfoJSON)
 
 	newMux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, req *http.Request) {
 		_, err := io.WriteString(w, wellKnown)
@@ -357,13 +406,15 @@ func (ts *testServer) run(t *testing.T) string {
 			w.WriteHeader(500)
 		}
 	})
-	newMux.HandleFunc("/userinfo", func(w http.ResponseWriter, req *http.Request) {
-		w.Header().Add("Content-Type", ts.contentType)
-		_, err := io.WriteString(w, ts.userInfo)
-		if err != nil {
-			w.WriteHeader(500)
-		}
-	})
+	if ts.userInfo != "" {
+		newMux.HandleFunc("/userinfo", func(w http.ResponseWriter, req *http.Request) {
+			w.Header().Add("Content-Type", ts.contentType)
+			_, err := io.WriteString(w, ts.userInfo)
+			if err != nil {
+				w.WriteHeader(500)
+			}
+		})
+	}
 	t.Cleanup(server.Close)
 	return server.URL
 }
@@ -463,6 +514,13 @@ func TestUserInfoEndpoint(t *testing.T) {
 				claims:        []byte(userInfoJSONCognitoVariant),
 			},
 		},
+		{
+			name: "no userinfo endpoint",
+			server: testServer{
+				contentType: "application/json",
+				userInfo:    "",
+			},
+		},
 	}
 
 	for _, test := range tests {
@@ -474,6 +532,19 @@ func TestUserInfoEndpoint(t *testing.T) {
 			provider, err := NewProvider(ctx, serverURL)
 			if err != nil {
 				t.Fatalf("Failed to initialize provider for test %v", err)
+			}
+
+			if test.server.userInfo == "" {
+				if provider.UserInfoEndpoint() != "" {
+					t.Errorf("expected UserInfoEndpoint to be empty, got %v", provider.UserInfoEndpoint())
+				}
+
+				// provider.UserInfo will error.
+				return
+			}
+
+			if provider.UserInfoEndpoint() != serverURL+"/userinfo" {
+				t.Errorf("expected UserInfoEndpoint to be %v , got %v", serverURL+"/userinfo", provider.UserInfoEndpoint())
 			}
 
 			fakeOauthToken := oauth2.Token{}
@@ -492,4 +563,196 @@ func TestUserInfoEndpoint(t *testing.T) {
 		})
 	}
 
+}
+
+type testIssuer struct {
+	baseURL string
+	algs    []string
+	jwks    *jose.JSONWebKeySet
+}
+
+func (t *testIssuer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	switch r.URL.Path {
+	case "/.well-known/openid-configuration":
+		disc := struct {
+			Issuer  string   `json:"issuer"`
+			JWKSURI string   `json:"jwks_uri"`
+			Algs    []string `json:"id_token_signing_alg_values_supported"`
+		}{
+			Issuer:  t.baseURL,
+			JWKSURI: t.baseURL + "/keys",
+			Algs:    t.algs,
+		}
+		if err := json.NewEncoder(w).Encode(disc); err != nil {
+			panic("encoding discover doc: " + err.Error())
+		}
+	case "/keys":
+		if err := json.NewEncoder(w).Encode(t.jwks); err != nil {
+			panic("encoding keys: " + err.Error())
+		}
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func TestVerifierAlg(t *testing.T) {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generating random key: %v", err)
+	}
+	pub := priv.Public()
+	pubKey := jose.JSONWebKey{
+		Algorithm: "ES256",
+		Key:       pub,
+		Use:       "sign",
+	}
+
+	signingKey := jose.SigningKey{
+		Algorithm: jose.ES256,
+		Key:       priv,
+	}
+
+	ts := &testIssuer{
+		algs: []string{"ES256"},
+		jwks: &jose.JSONWebKeySet{
+			Keys: []jose.JSONWebKey{
+				pubKey,
+			},
+		},
+	}
+	srv := httptest.NewServer(ts)
+	ts.baseURL = srv.URL
+
+	ctx := context.Background()
+
+	provider, err := NewProvider(ctx, srv.URL)
+	if err != nil {
+		t.Fatalf("creating provider: %v", err)
+	}
+
+	now := time.Now()
+
+	claims := struct {
+		Iss string `json:"iss"`
+		Sub string `json:"sub"`
+		Aud string `json:"aud"`
+		Exp int64  `json:"exp"`
+		Iat int64  `json:"iat"`
+	}{
+		Iss: srv.URL,
+		Sub: "test-user",
+		Aud: "test-client",
+		Exp: now.Add(time.Hour).Unix(),
+		Iat: now.Add(-time.Hour).Unix(),
+	}
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatalf("marshaling claims: %v", err)
+	}
+	signer, err := jose.NewSigner(signingKey, nil)
+	if err != nil {
+		t.Fatalf("creating signing key: %v", err)
+	}
+	jws, err := signer.Sign(payload)
+	if err != nil {
+		t.Fatalf("signing token: %v", err)
+	}
+	rawIDToken, err := jws.CompactSerialize()
+	if err != nil {
+		t.Fatalf("serializing token: %v", err)
+	}
+
+	config := &Config{
+		ClientID: "test-client",
+	}
+	verifier := provider.Verifier(config)
+	idToken, err := verifier.Verify(ctx, rawIDToken)
+	if err != nil {
+		t.Fatalf("verifying token: %v", err)
+	}
+	if idToken.Subject != "test-user" {
+		t.Errorf("expected subject 'test-user', got: %s", idToken.Subject)
+	}
+
+}
+
+func TestCanceledContext(t *testing.T) {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generating random key: %v", err)
+	}
+	pub := priv.Public()
+	pubKey := jose.JSONWebKey{
+		Algorithm: "ES256",
+		Key:       pub,
+		Use:       "sign",
+	}
+
+	signingKey := jose.SigningKey{
+		Algorithm: jose.ES256,
+		Key:       priv,
+	}
+
+	ts := &testIssuer{
+		algs: []string{"ES256"},
+		jwks: &jose.JSONWebKeySet{
+			Keys: []jose.JSONWebKey{
+				pubKey,
+			},
+		},
+	}
+	srv := httptest.NewServer(ts)
+	ts.baseURL = srv.URL
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	provider, err := NewProvider(ctx, srv.URL)
+	if err != nil {
+		t.Fatalf("creating provider: %v", err)
+	}
+
+	// Explicitly cancel the context.
+	cancel()
+
+	now := time.Now()
+
+	claims := struct {
+		Iss string `json:"iss"`
+		Sub string `json:"sub"`
+		Aud string `json:"aud"`
+		Exp int64  `json:"exp"`
+		Iat int64  `json:"iat"`
+	}{
+		Iss: srv.URL,
+		Sub: "test-user",
+		Aud: "test-client",
+		Exp: now.Add(time.Hour).Unix(),
+		Iat: now.Add(-time.Hour).Unix(),
+	}
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatalf("marshaling claims: %v", err)
+	}
+	signer, err := jose.NewSigner(signingKey, nil)
+	if err != nil {
+		t.Fatalf("creating signing key: %v", err)
+	}
+	jws, err := signer.Sign(payload)
+	if err != nil {
+		t.Fatalf("signing token: %v", err)
+	}
+	rawIDToken, err := jws.CompactSerialize()
+	if err != nil {
+		t.Fatalf("serializing token: %v", err)
+	}
+
+	config := &Config{
+		ClientID: "test-client",
+	}
+	verifier := provider.Verifier(config)
+
+	ctx = context.Background()
+	if _, err := verifier.Verify(ctx, rawIDToken); err != nil {
+		t.Fatalf("verifying token: %v", err)
+	}
 }

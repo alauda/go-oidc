@@ -4,17 +4,20 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"testing"
 	"time"
 
-	jose "gopkg.in/square/go-jose.v2"
+	jose "github.com/go-jose/go-jose/v4"
 )
 
 type keyServer struct {
@@ -39,7 +42,7 @@ type signingKey struct {
 }
 
 // sign creates a JWS using the private key from the provided payload.
-func (s *signingKey) sign(t *testing.T, payload []byte) string {
+func (s *signingKey) sign(t testing.TB, payload []byte) string {
 	privKey := &jose.JSONWebKey{Key: s.priv, Algorithm: string(s.alg), KeyID: s.keyID}
 
 	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: s.alg, Key: privKey}, nil)
@@ -58,12 +61,11 @@ func (s *signingKey) sign(t *testing.T, payload []byte) string {
 	return data
 }
 
-// jwk returns the public part of the signing key.
 func (s *signingKey) jwk() jose.JSONWebKey {
 	return jose.JSONWebKey{Key: s.pub, Use: "sig", Algorithm: string(s.alg), KeyID: s.keyID}
 }
 
-func newRSAKey(t *testing.T) *signingKey {
+func newRSAKey(t testing.TB) *signingKey {
 	priv, err := rsa.GenerateKey(rand.Reader, 1028)
 	if err != nil {
 		t.Fatal(err)
@@ -79,6 +81,14 @@ func newECDSAKey(t *testing.T) *signingKey {
 	return &signingKey{"", priv, priv.Public(), jose.ES256}
 }
 
+func newEdDSAKey(t *testing.T) *signingKey {
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &signingKey{"", privateKey, publicKey, jose.EdDSA}
+}
+
 func TestRSAVerify(t *testing.T) {
 	good := newRSAKey(t)
 	bad := newRSAKey(t)
@@ -89,6 +99,12 @@ func TestRSAVerify(t *testing.T) {
 func TestECDSAVerify(t *testing.T) {
 	good := newECDSAKey(t)
 	bad := newECDSAKey(t)
+	testKeyVerify(t, good, bad, good)
+}
+
+func TestEdDSAVerify(t *testing.T) {
+	good := newEdDSAKey(t)
+	bad := newEdDSAKey(t)
 	testKeyVerify(t, good, bad, good)
 }
 
@@ -123,6 +139,41 @@ func TestMismatchedKeyID(t *testing.T) {
 	testKeyVerify(t, key2, bad, key1, key2)
 }
 
+func TestKeyVerifyContextCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	payload := []byte("a secret")
+
+	good := newECDSAKey(t)
+	jws, err := jose.ParseSigned(good.sign(t, payload), allAlgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ch := make(chan struct{})
+	defer close(ch)
+
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-ch
+	}))
+	defer s.Close()
+
+	rks := newRemoteKeySet(ctx, s.URL, nil)
+
+	cancel()
+
+	// Ensure the token verifies.
+	_, err = rks.verify(ctx, jws)
+	if err == nil {
+		t.Fatal("expected context canceled, got nil error")
+	}
+
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected error to be %q got %q", context.Canceled, err)
+	}
+}
+
 func testKeyVerify(t *testing.T, good, bad *signingKey, verification ...*signingKey) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -134,11 +185,11 @@ func testKeyVerify(t *testing.T, good, bad *signingKey, verification ...*signing
 
 	payload := []byte("a secret")
 
-	jws, err := jose.ParseSigned(good.sign(t, payload))
+	jws, err := jose.ParseSigned(good.sign(t, payload), allAlgs)
 	if err != nil {
 		t.Fatal(err)
 	}
-	badJWS, err := jose.ParseSigned(bad.sign(t, payload))
+	badJWS, err := jose.ParseSigned(bad.sign(t, payload), allAlgs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,11 +234,11 @@ func TestRotation(t *testing.T) {
 	key2.keyID = "key2"
 
 	payload := []byte("a secret")
-	jws1, err := jose.ParseSigned(key1.sign(t, payload))
+	jws1, err := jose.ParseSigned(key1.sign(t, payload), allAlgs)
 	if err != nil {
 		t.Fatal(err)
 	}
-	jws2, err := jose.ParseSigned(key2.sign(t, payload))
+	jws2, err := jose.ParseSigned(key2.sign(t, payload), allAlgs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,5 +286,48 @@ func TestRotation(t *testing.T) {
 	}
 	if _, err := rks.verify(ctx, jws2); err != nil {
 		t.Errorf("failed to verify valid signature: %v", err)
+	}
+}
+
+func BenchmarkVerify(b *testing.B) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	key := newRSAKey(b)
+
+	now := time.Date(2022, 1, 29, 0, 0, 0, 0, time.UTC)
+	exp := now.Add(time.Hour)
+	payload := []byte(fmt.Sprintf(`{
+		"iss": "https://example.com",
+		"sub": "test_user",
+		"aud": "test_client_id",
+		"exp": %d
+	}`, exp.Unix()))
+
+	idToken := key.sign(b, payload)
+	server := &keyServer{
+		keys: jose.JSONWebKeySet{
+			Keys: []jose.JSONWebKey{key.jwk()},
+		},
+	}
+	s := httptest.NewServer(server)
+	defer s.Close()
+
+	rks := NewRemoteKeySet(ctx, s.URL)
+	verifier := NewVerifier("https://example.com", rks, &Config{
+		ClientID: "test_client_id",
+		Now:      func() time.Time { return now },
+	})
+
+	// Trigger the remote key set to query the public keys and cache them.
+	if _, err := verifier.Verify(ctx, idToken); err != nil {
+		b.Fatalf("verifying id token: %v", err)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := verifier.Verify(ctx, idToken); err != nil {
+			b.Fatalf("verifying id token: %v", err)
+		}
 	}
 }

@@ -1,11 +1,13 @@
 module github.com/coreos/go-oidc/v3
 
-go 1.14
+go 1.21
+
+toolchain go1.22.0
 
 require (
-	github.com/google/go-cmp v0.4.0 // indirect
-	github.com/stretchr/testify v1.5.1 // indirect
-	golang.org/x/net v0.0.0-20200505041828-1ed23360d12c
-	golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d
-	gopkg.in/square/go-jose.v2 v2.5.1
+	github.com/go-jose/go-jose/v4 v4.0.2
+	golang.org/x/net v0.27.0
+	golang.org/x/oauth2 v0.21.0
 )
+
+require golang.org/x/crypto v0.25.0 // indirect
